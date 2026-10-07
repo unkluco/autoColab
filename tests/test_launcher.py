@@ -390,6 +390,69 @@ class LauncherTests(unittest.TestCase):
         self.process.wait(timeout=10)
         self.assert_stopped()
 
+    def test_transient_native_start_failure_retries(self):
+        launcher = self.root / 'run_host.ps1'
+        source = launcher.read_text(encoding='utf-8')
+        token = '            $startup = New-Object AutoColabConsoleJobNative+STARTUPINFO'
+        injection = '''            $faultFile = Join-Path $PSScriptRoot 'fault-injected'
+            if (-not (Test-Path -LiteralPath $faultFile)) {
+                [IO.File]::WriteAllText($faultFile, 'once')
+                Throw-JobError 'Simulated temporary Windows launch failure.' 8
+            }
+'''
+        # Inject into the attempt, not the separate settings-query startup.
+        self.assertEqual(source.count(token), 1)
+        launcher.write_text(source.replace(token, injection + token), encoding='utf-8')
+        self.launch('heartbeat')
+        self.assertEqual(self.process.wait(timeout=15), 0, self.output())
+        self.assertIn('Simulated temporary Windows launch failure.', self.output())
+        self.assertIn('Retry in ', self.output())
+        self.assertEqual(len(self.attempts()), 1)
+
+    def test_restart_reloads_runtime_and_watchdog_together(self):
+        self.launch('crash_then_success', watchdog_seconds=.8)
+        self.hold_first_attempt()
+        config_file = self.root / 'config.toml'
+        config = json.loads(config_file.read_text())
+        new_runtime = self.root / 'new-runtime'
+        config['supervisor']['runtime_dir'] = str(new_runtime)
+        config_file.write_text(json.dumps(config))
+        self.assertEqual(self.process.wait(timeout=15), 0, self.output())
+        self.assertEqual(len(self.attempts()), 2, self.output())
+        self.assertTrue((new_runtime / 'status.json').exists())
+        self.assertNotIn('No valid host progress', self.output())
+
+    def test_first_settings_query_native_failure_also_retries(self):
+        launcher = self.root / 'run_host.ps1'
+        source = launcher.read_text(encoding='utf-8')
+        token = '\n        $startup = New-Object AutoColabConsoleJobNative+STARTUPINFO'
+        injection = '''
+        $faultFile = Join-Path $PSScriptRoot 'query-fault-injected'
+        if (-not (Test-Path -LiteralPath $faultFile)) {
+            [IO.File]::WriteAllText($faultFile, 'once')
+            Throw-JobError 'Simulated first settings query launch failure.' 8
+        }'''
+        self.assertEqual(source.count(token), 1)
+        source = source.replace(token, injection + token).replace('$restartDelay = 5.0', '$restartDelay = 0.1')
+        launcher.write_text(source, encoding='utf-8')
+        self.launch('heartbeat')
+        self.assertEqual(self.process.wait(timeout=15), 0, self.output())
+        self.assertIn('Simulated first settings query launch failure.', self.output())
+        self.assertIn('Retry in ', self.output())
+        self.assertEqual(len(self.attempts()), 1)
+
+    def test_uncertain_query_job_cleanup_is_fatal_not_retried(self):
+        launcher = self.root / 'run_host.ps1'
+        source = launcher.read_text(encoding='utf-8')
+        token = 'function Stop-HostJob([IntPtr]$Handle) {\n    try {'
+        self.assertIn(token, source)
+        injection = "\n    Throw-JobError 'Simulated unsafe query cleanup.' 8"
+        launcher.write_text(source.replace(token, token + injection), encoding='utf-8')
+        self.launch('heartbeat')
+        self.assertNotEqual(self.process.wait(timeout=15), 0)
+        self.assertEqual(self.attempts(), [])
+        self.assertNotIn('Retry in ', self.output())
+
 
 if __name__ == '__main__':
     unittest.main()

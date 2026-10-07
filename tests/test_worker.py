@@ -9,6 +9,8 @@ import json
 from pathlib import Path
 import re
 import tempfile
+import os
+import subprocess
 import threading
 import unittest
 
@@ -223,6 +225,44 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(worker.scan_once(), "stopped")
         self.assertEqual(calls, [])
         self.assertEqual(path.read_bytes(), original_bytes)
+
+    def test_response_marker_blocks_original_across_restart_but_other_files_progress(self):
+        bad = self.write_notebook('a.ipynb', notebook(cell('code', '@bot\n')))
+        good = self.write_notebook('b.ipynb', notebook(cell('code', '@bot\n')))
+        original = bad.read_bytes()
+        calls = []
+        def solve(snapshot, marker):
+            calls.append(snapshot.path)
+            return 'print("@bot")' if snapshot.path == bad else 'answer = 42'
+        worker = Worker(self.settings, solve)
+        self.assertEqual(worker.scan_once(), 'saved')
+        self.assertEqual(bad.read_bytes(), original)
+        self.assertEqual(calls, [bad, good])
+        self.assertEqual(worker.scan_once(), 'idle')
+        restarted = Worker(self.settings, solve)
+        self.assertEqual(restarted.scan_once(), 'idle')
+        self.assertEqual(len(calls), 2)
+        self.write_notebook('a.ipynb', notebook(cell('code', '# changed\n@bot\n')))
+        self.assertEqual(restarted.scan_once(), 'failed')
+        self.assertEqual(len(calls), 3)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows junction')
+    def test_junction_outside_watch_folder_is_not_scanned(self):
+        outside = self.root / 'outside'
+        outside.mkdir()
+        document = notebook(cell('code', '@bot\n'))
+        external = outside / 'external.ipynb'
+        external.write_text(json.dumps(document))
+        before = external.read_bytes()
+        junction = self.watch / 'linked'
+        result = subprocess.run(['cmd.exe', '/c', 'mklink', '/J', str(junction), str(outside)], capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        try:
+            worker = Worker(self.settings, lambda *_: 'must_not_be_written')
+            self.assertEqual(worker.scan_once(), 'idle')
+            self.assertEqual(external.read_bytes(), before)
+        finally:
+            junction.rmdir()
 
 
 if __name__ == "__main__":

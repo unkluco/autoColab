@@ -120,15 +120,18 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(list(self.root.glob('.*.tmp')), [])
 
     def test_edit_during_backup_is_discarded_and_unused_backup_removed(self):
-        original_prune = notebooks._prune_backups
+        original_fsync = notebooks.os.fsync
+        calls = 0
         changed = self.snapshot.raw + b'\n'
 
-        def edit_after_backup(*args, **kwargs):
-            original_prune(*args, **kwargs)
-            if kwargs.get('protected') is not None:
+        def edit_after_backup(handle):
+            nonlocal calls
+            original_fsync(handle)
+            calls += 1
+            if calls == 2:
                 self.path.write_bytes(changed)
 
-        with patch.object(notebooks, '_prune_backups', side_effect=edit_after_backup):
+        with patch.object(notebooks.os, 'fsync', side_effect=edit_after_backup):
             self.assertFalse(save_if_unchanged(self.snapshot, self.updated, self.backups))
         self.assertEqual(self.path.read_bytes(), changed)
         self.assertEqual(list(self.backups.iterdir()), [])
@@ -183,6 +186,41 @@ class StorageTests(unittest.TestCase):
                 save_if_unchanged(self.snapshot, self.updated, self.backups)
         self.assertEqual(existing.read_bytes(), b'previous backup')
         self.assertEqual(self.path.read_bytes(), self.snapshot.raw)
+
+    def test_failed_replace_preserves_old_backup_at_one_backup_limit(self):
+        old = self.managed_backup()
+        with patch.object(notebooks.os, 'replace', side_effect=PermissionError('locked')):
+            with self.assertRaises(PermissionError):
+                save_if_unchanged(self.snapshot, self.updated, self.backups, backup_max_count=1)
+        self.assertEqual(list(self.backups.iterdir()), [old])
+        self.assertEqual(self.path.read_bytes(), self.snapshot.raw)
+
+    def test_last_hash_conflict_preserves_old_backup_at_one_backup_limit(self):
+        old = self.managed_backup()
+        real_fsync = notebooks.os.fsync
+        calls = 0
+        def changed(handle):
+            nonlocal calls
+            real_fsync(handle)
+            calls += 1
+            if calls == 2:
+                self.path.write_bytes(self.snapshot.raw + b' ')
+        with patch.object(notebooks.os, 'fsync', side_effect=changed):
+            self.assertFalse(save_if_unchanged(self.snapshot, self.updated, self.backups, backup_max_count=1))
+        self.assertEqual(list(self.backups.iterdir()), [old])
+
+    def test_post_commit_retention_failure_reports_saved_and_is_bounded_next_time(self):
+        old = self.managed_backup()
+        with patch.object(notebooks, '_prune_backups', side_effect=PermissionError('backup locked')):
+            with self.assertLogs('autocolab', level='WARNING'):
+                self.assertTrue(save_if_unchanged(self.snapshot, self.updated, self.backups, backup_max_count=1))
+        self.assertTrue(old.exists())
+        self.assertEqual(len(list(self.backups.iterdir())), 2)
+        new = load_snapshot(self.path)
+        with patch.object(notebooks, '_prune_backups', side_effect=PermissionError('backup locked')):
+            with self.assertRaises(PermissionError):
+                save_if_unchanged(new, new.notebook, self.backups, backup_max_count=1)
+        self.assertEqual(len(list(self.backups.iterdir())), 2)
 
 
 if __name__ == '__main__':

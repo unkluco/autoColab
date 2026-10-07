@@ -6,12 +6,13 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import logging
 import math
 import os
 from pathlib import Path
 import re
 import stat
-import tempfile
+from storage_safety import OwnedTemp, within_root
 
 
 DEFAULT_NOTEBOOK_MAX_BYTES = 20 * 1024 * 1024
@@ -189,7 +190,10 @@ def _prune_backups(backup_dir: Path, max_count: int, max_bytes: int,
 def save_if_unchanged(snapshot: Snapshot, updated: dict, backup_dir=None, *,
                       backup_max_count: int = DEFAULT_BACKUP_MAX_COUNT,
                       backup_max_bytes: int = DEFAULT_BACKUP_MAX_BYTES,
-                      backup_max_age_days: float = DEFAULT_BACKUP_MAX_AGE_DAYS) -> bool:
+                      backup_max_age_days: float = DEFAULT_BACKUP_MAX_AGE_DAYS,
+                      journal_dir: Path | None = None, scope_root: Path | None = None) -> bool:
+    if scope_root is not None and not within_root(snapshot.path, scope_root):
+        raise NotebookError('Notebook is outside the scan scope or crosses a link/junction')
     if backup_dir is not None:
         for value, name in ((backup_max_count, 'count'), (backup_max_bytes, 'size')):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -203,13 +207,14 @@ def save_if_unchanged(snapshot: Snapshot, updated: dict, backup_dir=None, *,
             raise NotebookError('Notebook backup filenames must end in .ipynb')
     payload = (json.dumps(updated, ensure_ascii=False, indent=1, allow_nan=False) + '\n').encode('utf-8')
     # Write a complete sibling file first, then check the current bytes immediately before replacing.
-    handle, temporary_name = tempfile.mkstemp(prefix=f'.{snapshot.path.name}.', suffix='.tmp', dir=snapshot.path.parent)
-    temporary_path = Path(temporary_name)
+    temporary = OwnedTemp(snapshot.path.parent, journal_dir)
+    temporary_path = temporary.path
+    backup_temporary = None
     backup_path = None
     backup_created = False
     saved = False
     try:
-        with os.fdopen(handle, 'wb') as stream:
+        with temporary.open() as stream:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
@@ -221,28 +226,47 @@ def save_if_unchanged(snapshot: Snapshot, updated: dict, backup_dir=None, *,
             backup_dir.mkdir(parents=True, exist_ok=True)
             now = datetime.now(timezone.utc)
             cutoff = now - timedelta(days=backup_max_age_days)
-            # Reserve space before the write, so retention also prevents cumulative disk growth.
-            _prune_backups(backup_dir, backup_max_count - 1,
-                           backup_max_bytes - len(snapshot.raw), cutoff)
+            # Only repair an already exceeded cap from a previously committed save.
+            entries = _managed_backups(backup_dir)
+            if len(entries) > backup_max_count or sum(entry[2] for entry in entries) > backup_max_bytes:
+                _prune_backups(backup_dir, backup_max_count, backup_max_bytes, cutoff,
+                               protected=entries[-1][3] if entries else None)
             identity = hashlib.sha256(str(snapshot.path.resolve()).encode('utf-8')).hexdigest()[:12]
             stamp = now.strftime('%Y%m%dT%H%M%S%fZ')
             backup_path = backup_dir / f'{stamp}-{identity}-{snapshot.path.name}'
-            with backup_path.open('xb') as stream:
-                backup_created = True
+            backup_temporary = OwnedTemp(backup_dir, journal_dir)
+            with backup_temporary.open() as stream:
                 stream.write(snapshot.raw)
                 stream.flush()
                 os.fsync(stream.fileno())
-            _prune_backups(backup_dir, backup_max_count, backup_max_bytes, cutoff,
-                           protected=backup_path)
+            # Publish only a complete backup; never replace a colliding backup.
+            if os.name == 'nt':
+                os.rename(backup_temporary.path, backup_path)
+            else:
+                os.link(backup_temporary.path, backup_path)
+                backup_temporary.path.unlink()
+            backup_created = True
         # A Drive edit during backup preparation must still discard this answer.
         if not _matches_snapshot(snapshot):
             return False
+        if scope_root is not None and not within_root(snapshot.path, scope_root):
+            raise NotebookError('Notebook left the scan scope before saving')
         os.replace(temporary_path, snapshot.path)
         saved = True
+        if backup_dir is not None:
+            try:
+                _prune_backups(backup_dir, backup_max_count, backup_max_bytes, cutoff,
+                               protected=backup_path)
+            except OSError as exc:
+                logging.getLogger('autocolab').warning('Notebook saved; backup retention cleanup deferred: %s', exc)
         return True
     finally:
         try:
-            temporary_path.unlink(missing_ok=True)
+            temporary.cleanup()
         finally:
-            if backup_created and not saved:
-                backup_path.unlink(missing_ok=True)
+            try:
+                if backup_temporary is not None:
+                    backup_temporary.cleanup()
+            finally:
+                if backup_created and not saved:
+                    backup_path.unlink(missing_ok=True)

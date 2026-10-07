@@ -15,7 +15,7 @@ replace_entire_marker_line = true
 overwrite = true
 check_hash_before_write = true
 include_outputs_in_context = true
-# Bỏ qua notebook quá lớn, giữ nguyên file và báo trong log (20 MiB).
+# Bỏ qua notebook quá lớn, giữ nguyên file và báo trong log (100 MiB).
 max_bytes = 104857600
 
 [codex]
@@ -37,7 +37,7 @@ web_search = "disabled"
 [retry]
 # Khi CLI/file lỗi, đợi trước khi thử lại đúng bản nội dung đó.
 seconds = 20
-# Lỗi CLI lặp lại: nghỉ chung, tăng dần từ 30 đến 600 giây.
+# Lỗi CLI lặp lại: nghỉ chung, tăng dần từ 30 đến 90 giây.
 global_initial_seconds = 30
 global_max_seconds = 90
 # Xung đột đầu tiên quét lại ngay; sau 3 lần, tạm bỏ qua file 30 giây.
@@ -46,6 +46,8 @@ conflict_seconds = 30
 
 [runtime]
 directory = "runtime"
+# Tổng dung lượng thư mục calls; ngừng gọi nếu phần sót không thể dọn vượt giới hạn.
+call_max_bytes = 67108864
 # Ghi trạng thái: 1 lần đầu + 3 lần thử lại khi file bị khóa/từ chối thay thế.
 status_retry_delays_ms = [50, 100, 200]
 backup_enabled = true

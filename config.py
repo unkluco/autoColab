@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import hashlib
 from pathlib import Path
 import tomllib
 
@@ -51,14 +52,16 @@ class Settings:
     restart_reset_seconds: float = 300
     watchdog_seconds: float = 900
     status_retry_delays_ms: tuple[int, ...] = (50, 100, 200)
+    call_max_bytes: int = 64 * 1024 * 1024
+    config_digest: str = ''
 
 
 def load_settings(config_file: Path | str, watch_folder_override=None) -> Settings:
     config_file = Path(config_file).resolve()
     try:
-        with config_file.open('rb') as stream:
-            data = tomllib.load(stream)
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raw = config_file.read_bytes()
+        data = tomllib.loads(raw.decode('utf-8-sig'))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError(f'Cannot read config: {exc}') from exc
     base = config_file.parent
 
@@ -164,6 +167,8 @@ def load_settings(config_file: Path | str, watch_folder_override=None) -> Settin
         restart_reset_seconds=number(supervisor, 'restart_reset_seconds', 300, minimum=1),
         watchdog_seconds=watchdog,
         status_retry_delays_ms=tuple(status_delays),
+        call_max_bytes=number(runtime, 'call_max_bytes', 64 * 1024 * 1024, minimum=1, integer=True),
+        config_digest=hashlib.sha256(raw).hexdigest(),
     )
 
 
@@ -179,7 +184,7 @@ if __name__ == '__main__':
         print(json.dumps({name: getattr(settings, name) for name in (
             'restart_initial_seconds', 'restart_max_seconds',
             'restart_reset_seconds', 'watchdog_seconds')}
-            | {'runtime_dir': str(settings.runtime_dir)}, ensure_ascii=True))
+            | {'runtime_dir': str(settings.runtime_dir), 'config_digest': settings.config_digest}, ensure_ascii=True))
     except ConfigError as exc:
         print(f'Invalid AutoColab configuration: {exc}', file=sys.stderr)
         raise SystemExit(3)

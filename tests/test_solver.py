@@ -39,6 +39,11 @@ if mode == "timeout":
 if mode == "noisy":
     sys.stdout.buffer.write(b"x" * (1024 * 1024))
     sys.stdout.buffer.flush()
+if mode in ('detached', 'inherited'):
+    import subprocess
+    streams = {'stdin': subprocess.DEVNULL, 'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL} if mode == 'detached' else {}
+    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(3)'], **streams)
+    capture.with_suffix('.child.pid').write_text(str(child.pid))
 if mode != "missing":
     answer = " \n\t" if mode == "empty" else os.environ["AUTOCOLAB_TEST_ANSWER"]
     response = Path(arguments[arguments.index("--output-last-message") + 1])
@@ -288,6 +293,63 @@ class SolverTests(unittest.TestCase):
                 self.invoke()
         self.assertIsNotNone(processes[0].poll())
         self.assertEqual(list((self.runtime / 'calls').iterdir()), [])
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows process job')
+    def test_success_kills_children_with_detached_or_inherited_streams(self):
+        from single_instance import _process_start_id
+        for mode in ('detached', 'inherited'):
+            with self.subTest(mode=mode):
+                self.assertEqual(self.invoke(mode=mode), self.environment['AUTOCOLAB_TEST_ANSWER'])
+                pid = int(self.capture.with_suffix('.child.pid').read_text())
+                self.assertIsNone(_process_start_id(pid))
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows process job')
+    def test_assignment_failure_does_not_start_actual_cli(self):
+        with patch('solver.WindowsJob.assign', side_effect=OSError('cannot assign')):
+            with self.assertRaisesRegex(SolverError, 'cannot assign'):
+                self.invoke()
+        self.assertFalse(self.capture.exists())
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows command line')
+    def test_long_prompt_is_configuration_error_before_any_process(self):
+        from config import ConfigError
+        self.prompts['main'].write_text('x' * 40000)
+        with patch('solver.subprocess.Popen') as launch:
+            with self.assertRaisesRegex(ConfigError, 'too long for Windows'):
+                self.fake_solver()
+        launch.assert_not_called()
+
+    def test_scratch_overflow_rejects_answer(self):
+        with self.assertRaisesRegex(SolverError, 'scratch storage exceeded'):
+            self.invoke(answer='x' * 5000, settings=replace(self.settings, call_max_bytes=1024))
+        self.assertEqual(list((self.runtime / 'calls').iterdir()), [])
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows nested process jobs')
+    def test_solver_job_works_inside_supervisor_job(self):
+        from process_job import WindowsJob, gated_command
+        project = Path(__file__).resolve().parents[1]
+        snapshot = self.snapshot()
+        code = ('import sys; sys.path.insert(0, sys.argv[1]); '
+                'from config import load_settings; from solver import CodexSolver; '
+                'from notebooks import load_snapshot; s=CodexSolver(load_settings(sys.argv[2])); '
+                's.command=[sys.executable,sys.argv[3]]; n=load_snapshot(sys.argv[4]); '
+                'assert s(n,n.first_marker()); print("nested-ok")')
+        job = WindowsJob()
+        child = None
+        try:
+            with patch.dict(os.environ, self.environment):
+                child = subprocess.Popen(gated_command([sys.executable, '-c', code, str(project), str(self.settings.config_file), str(self.script), str(snapshot.path)]),
+                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                         creationflags=subprocess.CREATE_NO_WINDOW)
+                job.assign(child)
+                stdout, stderr = child.communicate(b'\0', timeout=15)
+            self.assertEqual(child.returncode, 0, stderr.decode('utf-8', errors='replace'))
+            self.assertIn(b'nested-ok', stdout)
+        finally:
+            job.stop()
+            job.close()
+            if child:
+                child.wait(timeout=5)
 
 
 if __name__ == "__main__":

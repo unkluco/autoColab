@@ -258,6 +258,7 @@ function New-HostJob {
 }
 
 function Stop-HostJob([IntPtr]$Handle) {
+    try {
     # Drain every descendant before creating the next job: an old CLI must never
     # overlap the next attempt. Closing the handle remains the crash safety net.
     if (-not [AutoColabConsoleJobNative]::TerminateJobObject($Handle, 1)) {
@@ -269,6 +270,25 @@ function Stop-HostJob([IntPtr]$Handle) {
             throw 'The old host process group did not stop; a new host was not started.'
         }
         Start-Sleep -Milliseconds 50
+    }
+    } catch {
+        $_.Exception.Data['AutoColabFatalCleanup'] = $true
+        throw
+    }
+}
+
+function Stop-UnassignedProcess([IntPtr]$Handle) {
+    if ($Handle -eq [IntPtr]::Zero) { return }
+    try {
+        if ([AutoColabConsoleJobNative]::WaitForSingleObject($Handle, 0) -ne 0) {
+            if (-not [AutoColabConsoleJobNative]::TerminateProcess($Handle, 1) -or
+                [AutoColabConsoleJobNative]::WaitForSingleObject($Handle, 5000) -ne 0) {
+                throw 'Unassigned helper could not be stopped; refusing another attempt.'
+            }
+        }
+    } catch {
+        $_.Exception.Data['AutoColabFatalCleanup'] = $true
+        throw
     }
 }
 
@@ -300,6 +320,7 @@ function Get-SupervisorSettings([IntPtr]$Parent) {
     # job too. Closing the console during this step leaves no helper behind.
     $queryJob = [IntPtr]::Zero
     $queryHandles = @()
+    $queryAssigned = $false
     $queryProcess = New-Object AutoColabConsoleJobNative+PROCESS_INFORMATION
     $queryFile = [IO.Path]::GetTempFileName()
     $queryStream = $null
@@ -331,6 +352,7 @@ function Get-SupervisorSettings([IntPtr]$Parent) {
             [void][AutoColabConsoleJobNative]::TerminateProcess($queryProcess.hProcess, 1)
             Throw-JobError 'Cannot own the supervisor settings helper.' $code
         }
+        $queryAssigned = $true
         if ([AutoColabConsoleJobNative]::ResumeThread($queryProcess.hThread) -eq [uint32]::MaxValue) {
             Throw-JobError 'Cannot start the supervisor settings helper.' ([Runtime.InteropServices.Marshal]::GetLastWin32Error())
         }
@@ -355,7 +377,10 @@ function Get-SupervisorSettings([IntPtr]$Parent) {
         }
     }
     finally {
-        try { if ($queryJob -ne [IntPtr]::Zero) { Stop-HostJob $queryJob } }
+        try {
+            if (-not $queryAssigned) { Stop-UnassignedProcess $queryProcess.hProcess }
+            if ($queryJob -ne [IntPtr]::Zero) { Stop-HostJob $queryJob }
+        }
         finally {
             if ($queryJob -ne [IntPtr]::Zero) { [void][AutoColabConsoleJobNative]::CloseHandle($queryJob) }
             if ($queryProcess.hThread -ne [IntPtr]::Zero) { [void][AutoColabConsoleJobNative]::CloseHandle($queryProcess.hThread) }
@@ -412,29 +437,42 @@ try {
         exit 2
     }
 
-    $query = Get-SupervisorSettings $parentHandle
-    if ($query.parent_closed) { exit 0 }
-    if ($query.exit_code -ne 0) {
-        Write-Host $query.output
-        Write-Host '[AutoColab] Fix the configuration and start again.'
-        exit $query.exit_code
-    }
-    $supervisor = $query.output | ConvertFrom-Json
-    $statusPath = Join-Path $supervisor.runtime_dir 'status.json'
-    $restartDelay = [double]$supervisor.restart_initial_seconds
+    # Safe fallback before a configuration query can succeed.
+    $supervisor = @{ restart_initial_seconds = 5; restart_max_seconds = 120; restart_reset_seconds = 300 }
+    $restartDelay = 5.0
+    $haveSettings = $false
 
     Write-Host '[AutoColab] Logs appear here. Closing this window stops the host and its children.'
     $parentClosed = $false
     while (-not $parentClosed) {
         if ([AutoColabConsoleJobNative]::WaitForSingleObject($parentHandle, 0) -eq 0) { break }
-        $jobHandle = New-HostJob
         $processInfo = New-Object AutoColabConsoleJobNative+PROCESS_INFORMATION
+        $jobAssigned = $false
         $attemptStarted = [DateTimeOffset]::UtcNow
         $attemptClock = [Diagnostics.Stopwatch]::StartNew()
         $lastProgressSeconds = 0.0
         $lastProgressIdentity = ''
         $failureReason = ''
         try {
+            # Each restarted worker and supervisor must use the same config version.
+            $query = Get-SupervisorSettings $parentHandle
+            if ($query.parent_closed) { $parentClosed = $true; $taskExitCode = 0; break }
+            if ($query.exit_code -ne 0) {
+                $taskExitCode = $query.exit_code
+                Write-Host $query.output
+                if ($taskExitCode -in @(2, 3)) { break }
+                throw 'Cannot read supervisor configuration for this attempt.'
+            }
+            $supervisor = $query.output | ConvertFrom-Json
+            $statusPath = Join-Path $supervisor.runtime_dir 'status.json'
+            if (-not $haveSettings) {
+                $restartDelay = [double]$supervisor.restart_initial_seconds
+                $haveSettings = $true
+            } else {
+                $restartDelay = [Math]::Min([double]$supervisor.restart_max_seconds,
+                    [Math]::Max([double]$supervisor.restart_initial_seconds, $restartDelay))
+            }
+            $jobHandle = New-HostJob
             $startup = New-Object AutoColabConsoleJobNative+STARTUPINFO
             $startup.cb = [Runtime.InteropServices.Marshal]::SizeOf($startup)
             $startup.dwFlags = [AutoColabConsoleJobNative]::STARTF_USESTDHANDLES
@@ -445,6 +483,9 @@ try {
             $taskCommand = [AutoColabConsoleJobNative]::Quote($taskPython) +
                 ' -X utf8 -u ' + [AutoColabConsoleJobNative]::Quote($taskBootstrap) +
                 ' --config ' + [AutoColabConsoleJobNative]::Quote($taskConfig)
+            if ($supervisor.config_digest) {
+                $taskCommand += ' --config-digest ' + [AutoColabConsoleJobNative]::Quote([string]$supervisor.config_digest)
+            }
             $commandLine = New-Object Text.StringBuilder($taskCommand)
 
             # Suspension closes the race in which bootstrap could spawn an unowned child.
@@ -461,6 +502,7 @@ try {
                 [void][AutoColabConsoleJobNative]::TerminateProcess($processInfo.hProcess, 1)
                 Throw-JobError 'Cannot assign the host to its process group.' $failureCode
             }
+            $jobAssigned = $true
             if ([AutoColabConsoleJobNative]::ResumeThread($processInfo.hThread) -eq [uint32]::MaxValue) {
                 Throw-JobError 'Cannot resume the environment bootstrap.' ([Runtime.InteropServices.Marshal]::GetLastWin32Error())
             }
@@ -503,11 +545,25 @@ try {
                 }
             }
         }
+        catch {
+            $problem = $_.Exception
+            while ($problem) {
+                if ($problem.Data['AutoColabFatalCleanup']) { throw }
+                $problem = $problem.InnerException
+            }
+            $taskExitCode = 1
+            $failureReason = 'Supervisor attempt failed: ' + $_.Exception.Message
+        }
         finally {
             # A fresh job is used on every restart, after this job has drained.
-            try { Stop-HostJob $jobHandle }
+            try {
+                if (-not $jobAssigned -and $processInfo.hProcess -ne [IntPtr]::Zero) {
+                    Stop-UnassignedProcess $processInfo.hProcess
+                }
+                if ($jobHandle -ne [IntPtr]::Zero) { Stop-HostJob $jobHandle }
+            }
             finally {
-                [void][AutoColabConsoleJobNative]::CloseHandle($jobHandle)
+                if ($jobHandle -ne [IntPtr]::Zero) { [void][AutoColabConsoleJobNative]::CloseHandle($jobHandle) }
                 $jobHandle = [IntPtr]::Zero
                 if ($processInfo.hThread -ne [IntPtr]::Zero) { [void][AutoColabConsoleJobNative]::CloseHandle($processInfo.hThread) }
                 if ($processInfo.hProcess -ne [IntPtr]::Zero) { [void][AutoColabConsoleJobNative]::CloseHandle($processInfo.hProcess) }

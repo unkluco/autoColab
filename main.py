@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
@@ -28,6 +27,9 @@ def launch_through_environment():
 
 # Prepare dependencies before importing worker modules, including future third-party libraries.
 if __name__ == '__main__':
+    if '--status' in sys.argv[1:] or '--stop' in sys.argv[1:]:
+        from controller import main as control_main
+        raise SystemExit(control_main(sys.argv[1:]))
     environment_result = launch_through_environment()
     if environment_result is not None:
         raise SystemExit(environment_result)
@@ -36,7 +38,7 @@ from config import ConfigError, load_settings
 from notebooks import load_snapshot
 from solver import CodexSolver, SolverError
 from worker import InstanceLock, Worker
-from single_instance import DuplicateInstance, MachineInstance, machine_status
+from single_instance import DuplicateInstance, MachineInstance
 
 
 def setup_logging(settings, quiet=False):
@@ -55,6 +57,10 @@ def setup_logging(settings, quiet=False):
 
 
 def main(argv=None):
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if '--status' in arguments or '--stop' in arguments:
+        from controller import main as control_main
+        return control_main(arguments)
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, 'reconfigure'):
             stream.reconfigure(encoding='utf-8', errors='replace')
@@ -69,45 +75,20 @@ def main(argv=None):
     mode.add_argument('--stop', action='store_true', help='Request a graceful stop (including active Codex call)')
     mode.add_argument('--runtime-dir', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--quiet', action='store_true', help='Write operational logs to file only')
+    parser.add_argument('--config-digest', default='', help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     try:
         settings = load_settings(args.config, args.watch_folder)
+        if args.config_digest and settings.config_digest != args.config_digest:
+            raise ConfigError('Configuration changed during launch; close and reopen the server')
         if args.runtime_dir:
             print(settings.runtime_dir)
-            return 0
-        if args.status or args.stop:
-            running, owner = machine_status()
-            if args.stop:
-                if running and owner:
-                    (Path(owner['runtime_dir']) / 'stop.request').write_text('stop\n', encoding='utf-8')
-                    print('Stop requested. Worker will cancel its active call and exit.')
-                elif running:
-                    print('A host is running, but its owner details are not accessible. Stop it from its original account/session.', file=sys.stderr)
-                    return 1
-                else:
-                    print('Worker is not running.')
-                return 0
-            status = {}
-            if running and owner:
-                try:
-                    status = json.loads((Path(owner['runtime_dir']) / 'status.json').read_text(encoding='utf-8'))
-                except (OSError, ValueError):
-                    pass
-                if status.get('instance_id') != owner['instance_id'] or status.get('pid') != owner['pid']:
-                    status = {'state': 'starting'}
-                status.update(owner)
-            status['running'] = running
-            if not running:
-                status['state'] = 'stopped'
-            elif not owner:
-                status['state'] = 'running_owner_unavailable'
-            print(json.dumps(status, ensure_ascii=False, indent=2))
             return 0
         if (args.check or args.dry_run or args.once) and not settings.watch_folder.is_dir():
             print(f'Watch folder is unavailable: {settings.watch_folder}', file=sys.stderr)
             return 1
-        if settings.watch_folder == settings.runtime_dir:
-            raise ConfigError('runtime.directory must differ from watch_folder')
+        if settings.watch_folder == settings.runtime_dir or settings.runtime_dir in settings.watch_folder.parents:
+            raise ConfigError('runtime.directory must not equal or contain watch_folder')
         if args.check:
             solver = CodexSolver(settings)
             print('Config OK; three prompt files found.')

@@ -153,6 +153,10 @@ Tự chạy lại và watchdog ở trên áp dụng cho `start.bat`/`run.cmd`. C
 
 `stop.ps1` gửi yêu cầu tới worker đang hoạt động. Trong khoảng launcher đang chờ chạy lại và chưa có worker, đóng cửa sổ CMD để dừng phiên giám sát. Khóa riêng của supervisor vẫn được giữ trong khoảng nghỉ này, nên mở thêm `start.bat` sẽ bị chặn.
 
+`--status` và `--stop` dùng controller riêng, không cài thư viện hoặc kiểm tra config/prompt trước khi điều khiển host. Cấu hình sai hoặc prompt bị xóa không chặn hai lệnh này. Status thiếu, hỏng hoặc sai kiểu dữ liệu được thay bằng trạng thái tối thiểu.
+
+Lỗi Windows tạm thời lúc tạo tiến trình hoặc đọc thiết lập supervisor cũng được thử lại. Trước mỗi lần khởi động lại, supervisor đọc lại các thiết lập để theo dõi đúng runtime của worker mới. Worker xác nhận hash của file cấu hình đã được supervisor đọc; nếu config đổi trong lúc chuẩn bị môi trường, phiên dừng và yêu cầu mở lại thay vì chạy với hai bản thiết lập khác nhau. Khi không xác nhận được cây tiến trình cũ đã dừng, supervisor vẫn dừng hẳn để tránh chồng phiên.
+
 Các script dùng `config.toml` bên cạnh chúng. Nếu PowerShell chặn script, vẫn có thể dùng `python main.py`, `python main.py --status` và `python main.py --stop`. Khi dừng, worker hủy lời gọi CLI đang chạy và giữ nguyên notebook nếu chưa ghi.
 
 Trên Windows, named mutex `Global\AutoColabHost_v1` ngăn chạy nhiều host trên cùng máy, kể cả khi đổi config/runtime hoặc sao chép dự án sang thư mục khác. Khởi chạy trùng trả exit code `2`, không gọi Codex và không sửa notebook. Mutex thuộc hệ điều hành nên tự nhả khi tiến trình chủ bị tắt; không dựa vào PID file còn sót. Vẫn giữ khóa file theo runtime làm lớp bảo vệ bổ sung. Tham khảo cách dùng mutex và exit code `2` của [chatlms](https://github.com/unkluco/chatlms/blob/fa5fb681b02f09d0f16a06606b5d2137c99433b6/lms_blog_bot.py#L210).
@@ -178,14 +182,18 @@ Nhận xét kết quả accuracy và loss ở trên.
 
 ## Luồng xử lý
 
-1. Quét các file `.ipynb` theo thứ tự đường dẫn; có thể quét cả thư mục con. Bỏ qua `.ipynb_checkpoints`, symlink và thư mục runtime.
+1. Quét các file `.ipynb` theo thứ tự đường dẫn; có thể quét cả thư mục con. Bỏ qua `.ipynb_checkpoints`, symlink, junction Windows và thư mục runtime. Kiểm tra đường dẫn thực thuộc thư mục quét cả trước khi đọc và trước khi ghi.
 2. Tìm marker đầu tiên trong `source` của các cell code/Markdown, theo thứ tự cell rồi dòng. Không tìm trong metadata, outputs hoặc cell raw.
 3. Ghép prompt chính và prompt của loại cell thành hướng dẫn riêng cho lời gọi CLI. Chuyển toàn bộ nội dung cell thành văn bản, giữ thứ tự. Có thêm output văn bản/lỗi khi bật `include_outputs_in_context`; metadata và ảnh không được gửi. Cell raw được đưa vào ngữ cảnh nhưng không sửa.
 4. Truyền ngữ cảnh qua UTF-8 stdin vào `codex exec`; đợi lời gọi hoàn tất. CLI chạy read-only, phiên tạm; mặc định tắt MCP/công cụ không cần cho sinh nội dung trong riêng lời gọi này. Vẫn dùng đăng nhập và model trong cấu hình Codex của bạn.
-5. Đọc file chứa câu trả lời cuối, không lấy progress/log từ console. Không bỏ Markdown fences, không sửa code, không tự kiểm tra cú pháp; chèn nguyên văn phản hồi. Phản hồi rỗng, sai encoding hoặc quá lớn thì giữ nguyên marker, nghỉ riêng file đó và cho file khác tiếp tục. CLI lỗi dịch vụ/runtime thì nghỉ chung với thời gian tăng dần trước khi gọi lại. Nếu không dọn được tiến trình CLI, host thoát lỗi để launcher dừng cả cây rồi phục hồi.
+5. Đọc file chứa câu trả lời cuối, không lấy progress/log từ console. Không bỏ Markdown fences, không sửa code, không tự kiểm tra cú pháp; chèn nguyên văn phản hồi hợp lệ. Phản hồi rỗng, sai encoding hoặc quá lớn thì giữ nguyên marker, nghỉ riêng file đó và cho file khác tiếp tục. Nếu phản hồi chứa lại marker, giữ nguyên notebook và tạm chặn đúng bản nội dung đó, kể cả sau restart, để tránh gọi vô hạn. Chỉnh notebook để thử lại; phản hồi gần nhất bị chặn nằm ở `runtime/rejected-answer.txt`. CLI lỗi dịch vụ/runtime thì nghỉ chung với thời gian tăng dần trước khi gọi lại. Nếu không dọn được tiến trình CLI, host thoát lỗi để launcher dừng cả cây rồi phục hồi.
 6. Xóa toàn bộ dòng chứa marker đầu tiên và thay bằng phản hồi. Host chỉ thêm dấu xuống dòng nếu cần để tách với dòng tiếp theo; độ thụt lề do Codex trả về được giữ nguyên. Các cell khác, metadata, ID, outputs và execution count giữ nguyên. Định dạng thụt lề của JSON file có thể thay đổi sau khi lưu.
 7. Ghi file tạm cùng thư mục. Tính lại SHA-256 trước khi tạo backup và ngay trước khi thay thế. Nếu khác bản đã đọc, bỏ câu trả lời và quét lại ngay; sau 3 xung đột liên tiếp, tạm bỏ qua file đó 30 giây để các file khác tiếp tục. Nếu giống, thay file bằng bản mới; mặc định có backup bản gốc bên ngoài Drive. Backup mới không sử dụng được xóa nếu xảy ra xung đột hoặc lỗi ghi.
 8. Sau mỗi vòng bình thường, chọn ngẫu nhiên khoảng nghỉ 4–7 giây rồi quét lại. Mỗi vòng chỉ ghi tối đa một marker; marker tiếp theo được giải với ngữ cảnh notebook đã cập nhật. Trong lúc CLI chạy, không quét hay gọi CLI song song.
+
+Mỗi lời gọi CLI trên Windows có Job Object riêng. Một launcher nhỏ đợi host gán vào job rồi mới được phép khởi động CLI; host dừng các tiến trình con còn sót cả khi đã nhận câu trả lời thành công. Job của cả phiên server vẫn giữ vai trò bảo vệ bên ngoài.
+
+Backup được ghi hoàn chỉnh trước khi công bố tên chính thức. Khi các backup hiện có đang trong giới hạn, chúng chỉ được dọn sau khi notebook đã ghi thành công; hash đổi hoặc lỗi ghi giữ nguyên các backup cũ. Trong lúc chuyển giao có thể cần thêm dung lượng bằng một bản gốc notebook. Nếu ổ không đủ chỗ, giữ nguyên notebook. Lỗi dọn sau khi lưu được cảnh báo; lần sau sửa phần vượt giới hạn trước khi tạo thêm, để không tích lũy không giới hạn.
 
 Hash kiểm tra bản file trên máy, không bảo đảm Google Drive đã nhận mọi chỉnh sửa từ đám mây. Khoảng kiểm tra rồi thay file vẫn có một cửa sổ rất nhỏ nếu ứng dụng khác ghi cùng lúc. Thời gian nhận thay đổi từ Drive phụ thuộc đồng bộ. Khoảng nghỉ ngẫu nhiên không bảo đảm tránh quota hoặc giới hạn của dịch vụ.
 
@@ -210,12 +218,15 @@ Chỉnh `config.toml`. Các đường dẫn tương đối tính từ thư mục
 - `retry.global_initial_seconds`, `global_max_seconds`: nghỉ chung khi CLI lỗi, tăng dần từ mức ban đầu đến mức tối đa trong cấu hình, có dao động ngẫu nhiên. Một lần CLI thành công đặt lại thời gian nghỉ. File vừa lỗi còn được nghỉ riêng để lần hồi phục có thể thử file khác.
 - `retry.conflict_limit`, `conflict_seconds`: sau bao nhiêu xung đột liên tiếp thì tạm bỏ qua file, mặc định 3 lần và 30 giây.
 - `runtime.directory`, `backup_enabled`, `log_level`, `log_max_bytes`, `log_backup_count`: nơi lưu và mức log/backup.
+- `runtime.call_max_bytes`: giới hạn tổng dung lượng `runtime/calls/`, mặc định 64 MiB. Host dọn thư mục lần gọi có dấu sở hữu của AutoColab trước lời gọi tiếp theo; không xóa thư mục không nhận diện được. CLI vượt giới hạn bị dừng; dữ liệu sót không thể dọn và vượt giới hạn thì cần kiểm tra trước khi mở lại.
 - `runtime.status_retry_delays_ms`: khoảng nghỉ giữa các lần thử thay file trạng thái khi bị khóa/từ chối truy cập. Mặc định `[50, 100, 200]` mili giây: một lần đầu và tối đa ba lần thử lại. Danh sách rỗng tắt thử lại; tổng thời gian chờ được giới hạn để worker không bị giữ quá lâu.
 - `runtime.backup_max_count`, `backup_max_bytes`, `backup_max_age_days`: tối đa 100 bản, 512 MiB, tuổi 14 ngày. Dọn khi chuẩn bị tạo backup tiếp theo; chỉ xóa các file backup do AutoColab nhận diện được. Nếu một backup bắt buộc vượt dung lượng cho phép, notebook được giữ nguyên.
 - `supervisor.restart_initial_seconds`, `restart_max_seconds`, `restart_reset_seconds`: khoảng nghỉ chạy lại host và thời gian đặt lại, mặc định 5, 120, 300 giây.
 - `supervisor.watchdog_seconds`: giới hạn không có tiến độ, mặc định 900 giây; phải ít nhất bằng `codex.timeout_seconds + 30`. Host cập nhật trạng thái định kỳ khi nghỉ, để khoảng nghỉ hợp lệ không bị coi là treo.
 
 `replace_entire_marker_line`, `overwrite`, `check_hash_before_write` phải là `true`, theo quy ước của bản này. Cấu hình được đọc lúc khởi động: dừng và chạy lại sau khi đổi. Nội dung prompt được đọc mỗi lần gọi nên có thể chỉnh trực tiếp khi worker đang chạy.
+
+Trên Windows, hướng dẫn Codex đi qua dòng lệnh nên prompt/config quá dài được phát hiện và báo lỗi cấu hình trước khi gọi. `--check` kiểm tra điều này cho các loại cell được bật; sửa prompt quá dài khi đang chạy cũng dừng phiên thay vì retry mãi.
 
 Không tự thực thi notebook. Code/Markdown do Codex tạo có thể cần bạn sửa tay. Các ô đã sửa vẫn giữ output cũ cho đến khi bạn chạy lại notebook.
 
@@ -225,6 +236,8 @@ Không tự thực thi notebook. Code/Markdown do Codex tạo có thể cần b�
 - `runtime/codex-last.log`: chẩn đoán lần gọi CLI gần nhất; có thể chứa nội dung notebook.
 - `runtime/status.json`: trạng thái, PID, vị trí cell và số lần đã lưu/lỗi/xung đột trong phiên.
 - `runtime/backups/`: byte gốc của notebook trước mỗi lần ghi thành công; tên có thời gian và mã đường dẫn để phân biệt các file trùng tên. Có thể chép bản cần phục hồi về đường dẫn notebook gốc; bản cũ được dọn theo giới hạn cấu hình.
+- `runtime/blocked-notebooks.json`: hash các bản notebook bị chặn vì phản hồi còn marker. Tự bỏ chặn khi nội dung file thay đổi. File này hỏng sẽ báo lỗi cấu hình thay vì tự mất bảo vệ khi restart.
+- `runtime/artifacts/`: nhật ký đường dẫn file tạm do host mới tạo. Khi Drive trở lại, host dọn file còn sót được ghi nhận và còn nằm trong phạm vi cho phép. Không dọn chung mọi file `.tmp`; file sót từ bản cũ chưa có nhật ký hoặc thư mục CLI chưa có dấu sở hữu cần kiểm tra riêng.
 
 Khi Windows từ chối thay file trạng thái vì quyền truy cập hoặc khóa file, worker thử lại theo `status_retry_delays_ms`, dùng cùng file tạm hoàn chỉnh. Nếu vẫn lỗi, cảnh báo có giới hạn tần suất và tiếp tục công việc; lần cập nhật sau vẫn thử lại. Lỗi khác như đầy ổ đĩa hoặc dữ liệu không thể chuyển thành JSON không dùng các lần thử lại này. Chế độ liên tục chờ khi Drive chưa sẵn sàng hoặc tạm mất kết nối. `--check`, `--dry-run`, `--once` vẫn báo lỗi ngay nếu thư mục không tồn tại. Khi không thể cập nhật trạng thái đủ lâu, watchdog của launcher chạy lại cả phiên. Đây là cơ chế phục hồi, không phải bằng chứng chương trình đã được thử liên tục 24 giờ.
 

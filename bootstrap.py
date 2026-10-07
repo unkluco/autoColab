@@ -84,11 +84,14 @@ def prepare_environment():
             checked([str(ENV_PYTHON), '-m', 'pip', 'install', '--disable-pip-version-check',
                      '--no-input', '-r', str(ROOT / 'requirements.txt')])
             checked([str(ENV_PYTHON), '-m', 'pip', 'check'])
-            checked([str(ENV_PYTHON), '-c', 'import config,notebooks,solver,worker,single_instance'])
+            checked([str(ENV_PYTHON), '-c', 'import config,notebooks,solver,worker,single_instance,controller,storage_safety,process_job'])
         return ENV_PYTHON
 
 
 def main():
+    if '--status' in sys.argv[1:] or '--stop' in sys.argv[1:]:
+        from controller import main as control_main
+        return control_main(sys.argv[1:])
     try:
         interpreter = prepare_environment()
         if sys.argv[1:] == ['--prepare-only']:

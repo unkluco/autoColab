@@ -7,11 +7,14 @@ import logging
 import os
 from pathlib import Path
 import random
+import re
 import tempfile
 import threading
 import time
 
 from config import Settings
+from config import ConfigError
+from storage_safety import path_link, within_root, recover_temps
 from notebooks import load_snapshot, save_if_unchanged
 from solver import SolverCleanupError, SolverError, SolverInputError, SolverResponseError, SolverStopped
 
@@ -103,6 +106,20 @@ class Worker:
         self.settings.runtime_dir.mkdir(parents=True, exist_ok=True)
         self.failures = {}
         self.conflicts = {}
+        self.blocked_path = self.settings.runtime_dir / 'blocked-notebooks.json'
+        self.blocked = {}
+        if self.blocked_path.exists():
+            try:
+                if self.blocked_path.stat().st_size > 4 * 1024 * 1024:
+                    raise ValueError('block registry too large')
+                self.blocked = json.loads(self.blocked_path.read_text(encoding='utf-8'))
+                if not isinstance(self.blocked, dict) or any(
+                    not isinstance(key, str) or not isinstance(value, str) or
+                    re.fullmatch(r'[0-9a-f]{64}', value) is None for key, value in self.blocked.items()):
+                    raise ValueError('invalid block registry')
+            except (OSError, ValueError) as exc:
+                raise ConfigError(f'Cannot read marker-loop protection registry: {exc}') from exc
+        self.next_artifact_cleanup = 0
         self.global_backoff_seconds = 0
         self.global_backoff_until = 0
         self.last_status_warning = None
@@ -144,7 +161,8 @@ class Worker:
 
         def excluded(path):
             resolved = path.resolve()
-            return resolved == runtime_dir or runtime_dir in resolved.parents
+            return (resolved == runtime_dir or runtime_dir in resolved.parents or
+                    not within_root(path, watch_folder))
 
         def walk_error(exc):
             logger.warning('Cannot scan a subfolder: %s', exc)
@@ -152,10 +170,10 @@ class Worker:
         for root, dirs, files in os.walk(watch_folder, followlinks=False, onerror=walk_error):
             root = Path(root)
             dirs[:] = sorted(name for name in dirs if name != '.ipynb_checkpoints' and
-                             not (root / name).is_symlink() and not excluded(root / name))
+                             not path_link(root / name) and not excluded(root / name))
             for name in files:
                 path = root / name
-                if path.suffix.lower() == '.ipynb' and not path.is_symlink() and not excluded(path):
+                if path.suffix.lower() == '.ipynb' and not path_link(path) and not excluded(path):
                     paths.append(path)
             if not self.settings.recursive:
                 dirs.clear()
@@ -172,6 +190,10 @@ class Worker:
         had_failure = False
         try:
             paths = self.list_notebooks()
+            if time.monotonic() >= self.next_artifact_cleanup:
+                recover_temps(self.settings.runtime_dir / 'artifacts',
+                              (self.settings.watch_folder, self.settings.runtime_dir))
+                self.next_artifact_cleanup = time.monotonic() + 60
         except OSError as exc:
             logger.error('%s', exc)
             self.update_status(state='waiting_for_folder', error=str(exc))
@@ -197,7 +219,15 @@ class Worker:
                 cooldown = self.failures.get(path)
                 if cooldown and cooldown[0] == identity and time.monotonic() < cooldown[1]:
                     continue
+                if not within_root(path, self.settings.watch_folder):
+                    continue
                 snapshot = load_snapshot(path, max_bytes=self.settings.notebook_max_bytes)
+                blocked = self.blocked.get(str(path))
+                if blocked == snapshot.digest:
+                    continue
+                if blocked is not None:
+                    del self.blocked[str(path)]
+                    write_json(self.blocked_path, self.blocked)
                 marker = snapshot.first_marker(self.settings.marker, self.settings.cell_types)
                 if marker is None:
                     self.failures.pop(path, None)
@@ -212,12 +242,24 @@ class Worker:
                 self.global_backoff_until = 0
                 if self.stopping():
                     return 'stopped'
+                if self.settings.marker in answer:
+                    # Persist before continuing, so restarts cannot reset this guard.
+                    self.blocked[str(path)] = snapshot.digest
+                    write_json(self.blocked_path, self.blocked)
+                    (self.settings.runtime_dir / 'rejected-answer.txt').write_text(answer, encoding='utf-8')
+                    logger.error('Answer still contains marker; pause this notebook until its content changes: %s', path)
+                    self.update_status(state='blocked_marker', current_file=str(path),
+                                       error='Answer contains active marker; edit notebook to retry')
+                    had_failure = True
+                    continue
                 updated = snapshot.replace(marker, answer)
                 backup_dir = self.settings.runtime_dir / 'backups' if self.settings.backup_enabled else None
                 if not save_if_unchanged(snapshot, updated, backup_dir,
                                          backup_max_count=self.settings.backup_max_count,
                                          backup_max_bytes=self.settings.backup_max_bytes,
-                                         backup_max_age_days=self.settings.backup_max_age_days):
+                                         backup_max_age_days=self.settings.backup_max_age_days,
+                                         journal_dir=self.settings.runtime_dir / 'artifacts',
+                                         scope_root=self.settings.watch_folder):
                     logger.info('File changed while Codex was answering; discard answer and rescan: %s', path)
                     self.failures.pop(path, None)
                     count = self.conflicts.get(path, (0, 0))[0] + 1
@@ -239,6 +281,8 @@ class Worker:
                 return 'stopped'
             except SolverCleanupError:
                 # The supervisor must drain the entire process group before another attempt.
+                raise
+            except ConfigError:
                 raise
             except SolverError as exc:
                 if isinstance(exc, (SolverInputError, SolverResponseError)):

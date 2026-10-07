@@ -11,8 +11,10 @@ import threading
 import time
 import tomllib
 
-from config import Settings
+from config import Settings, ConfigError
 from notebooks import Marker, Snapshot
+from process_job import WindowsJob, gated_command
+from storage_safety import recover_calls, directory_bytes, path_link
 
 
 class SolverError(RuntimeError):
@@ -102,11 +104,19 @@ def _send_input(process, payload):
 def _stop_process_tree(process, threads):
     """Best effort tree termination; no cancellation operation may wait forever."""
     errors = []
-    if os.name == 'nt':
+    job = getattr(process, '_autocolab_job', None)
+    if isinstance(job, WindowsJob):
         try:
-            subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'],
+            job.stop()
+        except OSError as exc:
+            errors.append(f'process job termination failed: {exc}')
+    elif os.name == 'nt':
+        try:
+            result = subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                            creationflags=subprocess.CREATE_NO_WINDOW, timeout=5)
+            if result.returncode:
+                errors.append(f'taskkill returned {result.returncode}')
         except subprocess.TimeoutExpired:
             errors.append('taskkill timed out')
         except OSError as exc:
@@ -164,6 +174,26 @@ class CodexSolver:
         self.settings = settings
         self.stop_event = stop_event or threading.Event()
         self.command = resolve_codex_command(settings.command)
+        self.validate_prompts()
+
+    def instructions(self, cell_type):
+        prompt = self.settings.code_prompt_file if cell_type == 'code' else self.settings.markdown_prompt_file
+        try:
+            text = self.settings.main_prompt_file.read_text(encoding='utf-8-sig') + '\n\n' + prompt.read_text(encoding='utf-8-sig')
+        except (OSError, UnicodeError) as exc:
+            raise ConfigError(f'Cannot read Codex instructions: {exc}') from exc
+        return text.replace('@bot', self.settings.marker)
+
+    def validate_arguments(self, arguments):
+        if os.name == 'nt':
+            command = subprocess.list2cmdline(gated_command(arguments))
+            if len(command.encode('utf-16-le')) // 2 >= 30000:
+                raise ConfigError('Codex command/instructions are too long for Windows; shorten prompt/configuration')
+
+    def validate_prompts(self):
+        for kind in self.settings.cell_types:
+            scratch = self.settings.runtime_dir / 'calls' / ('codex-' + 'x' * 8)
+            self.validate_arguments(self.build_arguments(scratch / 'answer.txt', scratch, self.instructions(kind)))
 
     def stopping(self):
         return self.stop_event.is_set() or (self.settings.runtime_dir / 'stop.request').exists()
@@ -209,14 +239,8 @@ class CodexSolver:
         settings = self.settings
         if self.stopping():
             raise SolverStopped('Worker stopped')
-        prompt_path = settings.code_prompt_file if marker.cell_type == 'code' else settings.markdown_prompt_file
         # Read on every call so prompt edits take effect without restarting the worker.
-        try:
-            instructions = settings.main_prompt_file.read_text(encoding='utf-8-sig') + '\n\n' + prompt_path.read_text(encoding='utf-8-sig')
-        except (OSError, UnicodeError) as exc:
-            raise SolverError(f'Cannot read Codex instructions: {exc}') from exc
-        if settings.marker != '@bot':
-            instructions = instructions.replace('@bot', settings.marker)
+        instructions = self.instructions(marker.cell_type)
         context = (
             f'Target: Cell {marker.cell_index + 1}, line {marker.line_index + 1}, type {marker.cell_type}.\n'
             f'Replace the entire first line containing {settings.marker!r}. Return only the replacement.\n\n'
@@ -234,12 +258,20 @@ class CodexSolver:
         calls_dir = settings.runtime_dir / 'calls'
         try:
             calls_dir.mkdir(parents=True, exist_ok=True)
+            if path_link(calls_dir):
+                raise ConfigError('runtime/calls must not be a link or junction')
+            recover_calls(calls_dir)
+            if directory_bytes(calls_dir, settings.call_max_bytes) > settings.call_max_bytes:
+                raise ConfigError('Codex scratch storage exceeds runtime.call_max_bytes; inspect abandoned files')
         except OSError as exc:
             raise SolverError(f'Cannot prepare Codex runtime: {exc}') from exc
         with tempfile.TemporaryDirectory(prefix='codex-', dir=calls_dir, ignore_cleanup_errors=True) as temporary:
             scratch = Path(temporary)
+            (scratch / '.autocolab-owned').write_text(scratch.name, encoding='ascii')
             response_file = scratch / 'answer.txt'
             args = self.build_arguments(response_file, scratch, instructions)
+            self.validate_arguments(args)
+            job = None
             log_path = settings.runtime_dir / 'codex-last.log'
             flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
             try:
@@ -247,24 +279,32 @@ class CodexSolver:
             except OSError as exc:
                 raise SolverError(f'Cannot open Codex log: {exc}') from exc
             try:
-                process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                job = WindowsJob() if os.name == 'nt' else None
+                process = subprocess.Popen(gated_command(args) if job else args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                            stderr=subprocess.STDOUT, cwd=scratch, creationflags=flags,
                                            start_new_session=os.name != 'nt')
             except OSError as exc:
                 output.stream.close()
+                if job:
+                    job.close()
                 raise SolverError(f'Cannot start Codex: {exc}') from exc
             threads = []
             deadline = time.monotonic() + settings.timeout_seconds
             try:
+                if job:
+                    process._autocolab_job = job
+                    job.assign(process)
                 output.start(process.stdout)
                 threads.append(output.thread)
-                writer = _send_input(process, payload)
+                writer = _send_input(process, b'\0' + payload if job else payload)
                 threads.append(writer)
                 while True:
                     if self.stopping():
                         raise SolverStopped('Worker stopped while Codex was running')
                     if output.problem:
                         raise SolverError(f'{output.problem}; see {log_path}')
+                    if directory_bytes(calls_dir, settings.call_max_bytes) > settings.call_max_bytes:
+                        raise SolverError('Codex scratch storage exceeded runtime.call_max_bytes')
                     if time.monotonic() >= deadline:
                         raise SolverError(f'Codex timed out after {settings.timeout_seconds:g}s; see {log_path}')
                     try:
@@ -273,6 +313,14 @@ class CodexSolver:
                     except subprocess.TimeoutExpired:
                         pass
                 # Children may have inherited a pipe even after the CLI exits. Do not wait forever.
+                if job:
+                    job.stop()
+                elif os.name != 'nt':
+                    import signal
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
                 cleanup_deadline = time.monotonic() + 5
                 for thread in threads:
                     thread.join(timeout=max(0, cleanup_deadline - time.monotonic()))
@@ -280,11 +328,22 @@ class CodexSolver:
                         raise SolverError(f'Codex exited but {thread.name} is still open; see {log_path}')
                 if output.problem:
                     raise SolverError(f'{output.problem}; see {log_path}')
+                if directory_bytes(calls_dir, settings.call_max_bytes) > settings.call_max_bytes:
+                    raise SolverError('Codex scratch storage exceeded runtime.call_max_bytes')
             except BaseException as exc:
                 cleanup_error = _stop_process_tree(process, threads)
                 if cleanup_error:
                     raise SolverCleanupError(f'{exc}; cleanup did not complete: {cleanup_error}') from exc
                 raise
+            finally:
+                if job:
+                    job.close()
+                if output.thread is None:
+                    for stream in (output.stream, process.stdin, process.stdout):
+                        try:
+                            stream.close()
+                        except (OSError, ValueError):
+                            pass
             if process.returncode:
                 raise SolverError(f'Codex failed (exit {process.returncode}); see {log_path}')
             if not response_file.is_file():

@@ -1,4 +1,4 @@
-Dòng @bot đầu tiên nằm trong cell code.
+Vị trí @bot mà host chỉ định trong Target nằm trong cell code.
 Trả về code thuần phù hợp với ngôn ngữ và ngữ cảnh của notebook. Không bọc code trong dấu ``` và không thêm lời giải thích ngoài code.
 Code trả về sẽ thay toàn bộ dòng chứa @bot; các dòng trước và sau được giữ nguyên. Không chép lại các dòng đó.
 Giữ độ thụt lề phù hợp với vị trí chèn; nếu dòng @bot nằm trong hàm hoặc khối lệnh, code phải thuộc đúng khối đó.
