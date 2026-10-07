@@ -1,0 +1,67 @@
+# Môi trường và cache Python: tạo lại trên mỗi máy.
+/.venv/
+/venv/
+/env/
+/ENV/
+__pycache__/
+*.py[cod]
+.Python
+
+# Dữ liệu hoạt động, backup notebook, file thử và bản xuất cục bộ.
+/runtime/
+/work/
+/outputs/
+*.log
+*.log.*
+
+# Cấu hình riêng và thông tin đăng nhập; giữ config.toml chung trong repo.
+config.local.toml
+config.*.local.toml
+config.private.toml
+.env
+.env.*
+!.env.example
+!.env.template
+/.codex/
+.npmrc
+auth.json
+auth.json.*
+credentials.json
+credentials.*.json
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Cache kiểm thử, báo cáo coverage và sản phẩm đóng gói Python.
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+/build/
+/dist/
+*.egg-info/
+node_modules/
+
+# File tạm của editor, notebook và hệ điều hành.
+.ipynb_checkpoints/
+.vscode/
+.idea/
+*.code-workspace
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Không bỏ qua *.ipynb: notebook mẫu trong examples/ vẫn cần được commit.
+# Mã nguồn, tests/, prompts/, requirements.txt và config.toml vẫn được theo dõi.

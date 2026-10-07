@@ -1,0 +1,67 @@
+# Thư mục Google Drive đã đồng bộ trên máy.
+watch_folder = 'G:\My Drive\Colab Notebooks'
+recursive = true
+
+[scan]
+# Sau mỗi vòng xử lý, chọn ngẫu nhiên số giây trong khoảng này rồi đợi.
+min_seconds = 4
+max_seconds = 7
+
+[notebook]
+marker = "#cout"
+cell_types = ["code", "markdown"]
+# Xử lý lần xuất hiện đầu tiên theo thứ tự cell rồi dòng.
+replace_entire_marker_line = true
+overwrite = true
+check_hash_before_write = true
+include_outputs_in_context = true
+# Bỏ qua notebook quá lớn, giữ nguyên file và báo trong log (20 MiB).
+max_bytes = 104857600
+
+[codex]
+command = "codex"
+# Để trống để dùng model hiện được cấu hình trong Codex CLI.
+model = "gpt-6.1-sol"
+main_prompt_file = "prompts/main.txt"
+code_prompt_file = "prompts/code.txt"
+markdown_prompt_file = "prompts/markdown.txt"
+timeout_seconds = 300
+context_max_chars = 2000000
+# Giới hạn log của một lời gọi CLI (10 MiB).
+log_max_bytes = 10485760
+# Giữ đăng nhập/model của CLI; tắt MCP và các công cụ không cần cho việc sinh nội dung.
+disable_mcp_servers = true
+disabled_features = ["shell_tool", "multi_agent", "apps", "plugins", "hooks", "browser_use", "computer_use", "image_generation"]
+web_search = "disabled"
+
+[retry]
+# Khi CLI/file lỗi, đợi trước khi thử lại đúng bản nội dung đó.
+seconds = 20
+# Lỗi CLI lặp lại: nghỉ chung, tăng dần từ 30 đến 600 giây.
+global_initial_seconds = 30
+global_max_seconds = 90
+# Xung đột đầu tiên quét lại ngay; sau 3 lần, tạm bỏ qua file 30 giây.
+conflict_limit = 3
+conflict_seconds = 30
+
+[runtime]
+directory = "runtime"
+# Ghi trạng thái: 1 lần đầu + 3 lần thử lại khi file bị khóa/từ chối thay thế.
+status_retry_delays_ms = [50, 100, 200]
+backup_enabled = true
+# Chỉ dọn các backup do AutoColab tạo; giới hạn toàn bộ thư mục backup.
+backup_max_count = 100
+backup_max_bytes = 536870912
+backup_max_age_days = 14
+log_level = "INFO"
+log_max_bytes = 5242880
+log_backup_count = 3
+
+[supervisor]
+# start.bat tự chạy lại khi host lỗi; đóng cửa sổ vẫn dừng toàn bộ phiên.
+restart_initial_seconds = 5
+restart_max_seconds = 120
+restart_reset_seconds = 300
+# Không có tiến triển trong 15 phút: dừng cây tiến trình rồi chạy lại.
+# Phải lớn hơn timeout Codex ít nhất 30 giây.
+watchdog_seconds = 900

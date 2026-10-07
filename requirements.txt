@@ -1,0 +1,2 @@
+# AutoColab currently uses only Python's standard library (Python 3.11+).
+# Add third-party dependencies here if the worker is extended.
