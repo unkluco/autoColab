@@ -119,6 +119,55 @@ git status --short
 | Chuẩn bị môi trường thất bại | Xem `work/setup.log`, kiểm tra mạng và quyền ghi thư mục dự án. |
 | Báo server đã chạy | Dùng cửa sổ đang mở; cơ chế chống chạy trùng sẽ chặn phiên thứ hai trên máy. |
 
+## Cấu trúc thư mục
+
+```text
+autocolab/
+├── README.md             # Hướng dẫn cài đặt, sử dụng và vận hành
+├── config.toml           # Cấu hình thư mục quét, marker, CLI và thời gian chờ
+├── requirements.txt      # Các thư viện Python cần cho dự án
+├── .gitignore            # Loại dữ liệu cục bộ và thông tin riêng khỏi Git
+├── .gitattributes        # Quy ước xuống dòng và file nhị phân
+├── start.bat             # Nhấp đúp để mở server và xem log
+├── run.cmd               # Chuyển tới start.bat
+├── run_host.ps1          # Giám sát host, chống chạy trùng và tự khởi động lại
+├── start.ps1             # Chạy trực tiếp hoặc chạy nền
+├── status.ps1            # Xem trạng thái host
+├── stop.ps1              # Gửi yêu cầu dừng host
+├── main.py               # Điểm vào chương trình và các tùy chọn dòng lệnh
+├── bootstrap.py          # Kiểm tra/tạo .venv và chuẩn bị thư viện
+├── config.py             # Đọc và kiểm tra cấu hình
+├── controller.py         # Xử lý lệnh status/stop độc lập với môi trường host
+├── worker.py             # Vòng quét, xử lý tuần tự, retry và cập nhật trạng thái
+├── notebooks.py          # Đọc notebook, tìm marker, tạo ngữ cảnh, kiểm tra hash và lưu
+├── solver.py             # Gọi Codex CLI, nhận phản hồi và kiểm soát giới hạn
+├── single_instance.py    # Khóa chống nhiều host và xác minh phiên đang chạy
+├── process_job.py        # Quản lý tiến trình CLI và tiến trình con trên Windows
+├── storage_safety.py     # Kiểm tra phạm vi đường dẫn và phục hồi file tạm
+├── prompts/
+│   ├── main.txt          # Hướng dẫn chung cho mọi lời gọi
+│   ├── code.txt          # Hướng dẫn riêng cho cell code
+│   └── markdown.txt      # Hướng dẫn riêng cho cell Markdown
+├── examples/
+│   └── demo.ipynb        # Notebook mẫu để thử marker
+├── tests/                # Kiểm thử notebook, CLI, lưu file và vòng đời host
+├── .venv/                # Môi trường Python tự tạo trên máy
+├── work/                 # Dữ liệu chuẩn bị môi trường, gồm setup.log
+└── runtime/              # Log, trạng thái, backup và dữ liệu hoạt động
+    ├── worker.log
+    ├── codex-last.log
+    ├── status.json
+    ├── blocked-notebooks.json
+    ├── rejected-answer.txt
+    ├── backups/
+    ├── artifacts/
+    └── calls/            # Dữ liệu tạm của từng lời gọi CLI
+```
+
+`.venv/`, `work/` và `runtime/` là dữ liệu cục bộ, được tạo khi cần và không đi kèm khi clone. Các file trong `runtime/` xuất hiện tùy hoạt động của host; `rejected-answer.txt` chỉ được tạo khi phản hồi còn chứa marker. Cây trên dùng đường dẫn runtime mặc định; có thể đổi bằng `runtime.directory`.
+
+Notebook cần xử lý nằm ở thư mục riêng do `watch_folder` chỉ định, hiện là `G:\My Drive\Colab Notebooks`. Thư mục này nằm ngoài dự án. Vai trò và cách sử dụng log/backup được mô tả thêm ở mục [Log, trạng thái và backup](#log-trạng-thái-và-backup).
+
 ## Khởi chạy
 
 **Cách đơn giản nhất: nhấp đúp `start.bat`.** Cửa sổ CMD hiển thị log trực tiếp; giữ cửa sổ mở để host chạy. Đóng cửa sổ là dừng host và toàn bộ tiến trình con, kể cả Codex đang chạy. `run.cmd` cũng chuyển tới cùng cơ chế này.
